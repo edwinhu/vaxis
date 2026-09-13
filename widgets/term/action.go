@@ -41,6 +41,9 @@ func applySequence(vt *Model, seq ansi.Sequence) {
 			sixelAction{seq: seq}.apply(vt)
 		}
 	case ansi.APC:
+		if vt.kittyGraphics(seq.Data) {
+			return
+		}
 		vt.postEvent(EventAPC{Payload: seq.Data})
 	}
 }

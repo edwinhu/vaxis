@@ -16,6 +16,10 @@ type Image struct {
 	cols      int
 	img       image.Image
 	vaxii     []*vaxisImage
+	// kitty is set when this entry is not an image at all but a PLACEMENT of
+	// a host-side image the child transmitted. img stays nil for those: the
+	// pixels live in the host terminal, never here.
+	kitty *kittyPlacement
 }
 
 type positionedImage struct {
@@ -36,4 +40,11 @@ func (img *Image) destroy() {
 		cached.vxImage.Destroy()
 	}
 	img.vaxii = nil
+	if img.kitty != nil {
+		// Every path in term.go that drops an *Image goes through here, so
+		// this is where a relayed placement stops being drawn -- without any
+		// of those paths having to know about the relay.
+		img.kitty.retire(img)
+		img.kitty = nil
+	}
 }

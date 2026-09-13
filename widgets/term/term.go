@@ -40,6 +40,30 @@ type Model struct {
 	// protocol state through the terminal widget. Only enable this when the
 	// host terminal supports Kitty keyboard encoding.
 	EnableKittyKeyboard bool
+
+	// EnableKittyFileMedia allows a child's kitty graphics command to name a
+	// FILE or a POSIX shared-memory object as the source of its pixels
+	// (t=f, t=t, t=s) instead of carrying them inline.
+	//
+	// Off by default, and that default is load-bearing: the name is relayed to
+	// the HOST terminal, which opens it, so a child that renders untrusted
+	// input would be choosing a path for the real terminal to read. Enable it
+	// only for children you trust.
+	EnableKittyFileMedia bool
+
+	// PaintOnDrain paints the instant the child's output drains instead of
+	// waiting for the 8 ms coalescing timer.
+	//
+	// Off by default: with it off the timer is the widget's only paint source,
+	// which is what every caller had before this option existed. Turn it on
+	// (WithPaintOnDrain) for a child whose frames the user is waiting on, where
+	// those 8 ms are the difference between a scroll that tracks the key and
+	// one that lags it.
+	//
+	// Set once at construction, before Start spawns the parser goroutine that
+	// reads it, and never written afterwards. The go statement orders that
+	// single write before every read, so no lock and no atomic is needed.
+	PaintOnDrain bool
 	// AllowKeyboardActionMode allows ANSI KAM (SM 2) to suppress keyboard input.
 	// It is disabled by default because applications can otherwise make the
 	// terminal ignore user typing.
@@ -102,6 +126,41 @@ type Model struct {
 	syncTimer    *time.Timer
 	replyQueue   chan termReply
 	replyCancel  context.CancelFunc
+	kittyHost    kittyRelayHost
+	kitty        *kittyState
+	// kittyPrep carries the off-lock scan of the sequence being applied. It
+	// is set and cleared by update, both under vt.mu, and is nil elsewhere.
+	kittyPrep *kittyPrepared
+	// kittyDestroyPending mirrors "kitty.pendingDestroy is non-empty" outside
+	// the lock. update defers a drain once per parsed rune or escape, so the
+	// drain has to be able to decide it has nothing to do with a single atomic
+	// load; taking vt.mu to find an empty queue would double the lock traffic
+	// on the hottest path in the widget.
+	kittyDestroyPending atomic.Bool
+	// lastRedraw records which path dispatched the most recent vaxis.Redraw{},
+	// and redrawCount how many this file has dispatched. Both are read from
+	// outside the parser goroutine that writes them, so both are atomic.
+	lastRedraw  atomic.Int32
+	redrawCount atomic.Int64
+}
+
+// redrawSource names the path a vaxis.Redraw{} was dispatched from.
+type redrawSource int32
+
+const (
+	redrawSourceNone redrawSource = iota
+	// redrawSourceTimer is the coalescing 8 ms timer armed by invalidate.
+	redrawSourceTimer
+	// redrawSourceDrain is an immediate paint taken because the pty drained.
+	redrawSourceDrain
+)
+
+func (vt *Model) lastRedrawSource() redrawSource {
+	return redrawSource(vt.lastRedraw.Load())
+}
+
+func (vt *Model) redraws() int64 {
+	return vt.redrawCount.Load()
 }
 
 type cursorState struct {
@@ -126,6 +185,11 @@ func WithVaxis(vx *vaxis.Vaxis) Option {
 	return func(m *Model) {
 		m.vx = vx
 		m.EnableKittyKeyboard = vx != nil && vx.CanKittyKeyboard()
+		if vx != nil {
+			// The same instance is also the host a child's kitty graphics are
+			// relayed to.
+			m.kittyHost = vaxisKittyHost{vx: vx}
+		}
 	}
 }
 
@@ -142,6 +206,13 @@ func WithKittyKeyboard(enabled bool) Option {
 func WithKeyboardActionMode(enabled bool) Option {
 	return func(m *Model) {
 		m.AllowKeyboardActionMode = enabled
+	}
+}
+
+// WithPaintOnDrain controls whether the widget paints on pty-drain.
+func WithPaintOnDrain(enabled bool) Option {
+	return func(m *Model) {
+		m.PaintOnDrain = enabled
 	}
 }
 
@@ -254,6 +325,19 @@ func (vt *Model) StartWithSize(cmd *exec.Cmd, width int, height int) error {
 					return
 				default:
 					vt.update(seq)
+					// Nothing queued behind this sequence and the parser is
+					// blocked waiting for the child: this frame is the one the
+					// user is waiting on, and there is nothing left to
+					// coalesce it with. Paint it now instead of spending the
+					// 8 ms timer on a successor that is not coming.
+					//
+					// Only for a caller that asked. PaintOnDrain is read first
+					// so that a widget without it does not pay for the drain
+					// probe at all, and invalidate's 8 ms timer stays its one
+					// and only paint source.
+					if vt.PaintOnDrain && len(vt.parser.Next()) == 0 && !vt.parser.Pending() {
+						vt.redrawOnDrain()
+					}
 				}
 			case ev := <-vt.events:
 				vt.dispatchEvent(ev)
@@ -261,6 +345,8 @@ func (vt *Model) StartWithSize(cmd *exec.Cmd, width int, height int) error {
 				vt.mu.Lock()
 				vt.timer.Stop()
 				vt.mu.Unlock()
+				vt.lastRedraw.Store(int32(redrawSourceTimer))
+				vt.redrawCount.Add(1)
 				vt.dispatchEvent(vaxis.Redraw{})
 			}
 		}
@@ -424,12 +510,63 @@ func (vt *Model) invalidate() {
 	vt.timer.Reset(8 * time.Millisecond)
 }
 
+// redrawOnDrain consumes the outstanding invalidation immediately, for the case
+// where the pty has drained and the 8 ms timer would only be adding latency to
+// a frame it has nothing to fold together with.
+//
+// Exactly one redraw comes out of it, because dirty is the record of a paint
+// being owed and this is the one place that both clears it and dispatches: a
+// second call before the next invalidate finds dirty already false and returns
+// without painting. The 8 ms timer is cancelled for the same reason -- the
+// paint it was armed for has just happened -- and its channel drained, since a
+// fire that beat the Stop would otherwise be picked up by the select as a
+// second, redundant Redraw for this frame.
+//
+// Only the select goroutine started by StartWithSize calls this, and that
+// goroutine is also the sole receiver of vt.timer.C, so the non-blocking drain
+// below cannot steal a fire from anyone. invalidate may run concurrently on a
+// host goroutine; vt.mu makes the read-clear-stop one step against it, and an
+// invalidate that lands just after leaves the timer armed for its own paint.
+func (vt *Model) redrawOnDrain() {
+	vt.mu.Lock()
+	owed := vt.dirty
+	vt.dirty = false
+	if !vt.timer.Stop() {
+		select {
+		case <-vt.timer.C:
+		default:
+		}
+	}
+	vt.mu.Unlock()
+	if !owed {
+		return
+	}
+	vt.lastRedraw.Store(int32(redrawSourceDrain))
+	vt.redrawCount.Add(1)
+	vt.dispatchEvent(vaxis.Redraw{})
+}
+
 // update is called from the PTY routine...this is updating the internal model
 // based on the underlying process
 func (vt *Model) update(seq ansi.Sequence) {
+	// A kitty APC's per-frame work -- the O(len) base64 scan of an inline
+	// payload, the filesystem validation of a named source -- is over bytes a
+	// child chose and must not run under vt.mu, which every Draw and every
+	// reader also wants.
+	var prep *kittyPrepared
+	if apc, ok := seq.(ansi.APC); ok {
+		prep = vt.prepareKittySequence(apc.Data)
+	}
+
+	// Registered before the Unlock below so it runs after it: freeing a host
+	// image is a synchronous write to the real terminal.
+	defer vt.drainKittyDestroys()
+
 	vt.mu.Lock()
 	defer vt.mu.Unlock()
 	defer vt.invalidate()
+	vt.kittyPrep = prep
+	defer func() { vt.kittyPrep = nil }()
 	applySequence(vt, seq)
 }
 
@@ -1475,6 +1612,7 @@ func (vt *Model) Close() {
 	if ptyFile != nil {
 		_ = ptyFile.Close()
 	}
+	vt.releaseKittyRelays()
 }
 
 func (vt *Model) Draw(win vaxis.Window) {
@@ -1492,6 +1630,7 @@ func (vt *Model) Draw(win vaxis.Window) {
 		win.ShowCursor(snapshot.cursorCol, snapshot.cursorRow, snapshot.cursorStyle)
 	}
 	vt.removeGraphicsPlacements(snapshot.vx, snapshot.allGraphics)
+	vt.drawKittyRelays(win, snapshot.graphics)
 	vt.drawGraphics(win, snapshot.vx, snapshot.graphics)
 }
 
@@ -1612,6 +1751,12 @@ func (vt *Model) drawGraphics(win vaxis.Window, vx *vaxis.Vaxis, graphics []posi
 outer:
 	for _, graphic := range graphics {
 		img := graphic.img
+		if img.img == nil {
+			// A relayed kitty placement: the host holds the pixels, so there
+			// is nothing here to encode. drawKittyRelays already placed it,
+			// and vx.NewImage(nil) segfaults inside resizeImage.
+			continue
+		}
 		if vxImg := vt.cachedVaxisImage(img, vx); vxImg != nil {
 			win := win.New(graphic.col, graphic.row, -1, -1)
 			vxImg.Draw(win)
