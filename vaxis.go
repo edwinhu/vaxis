@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.rockorager.dev/vaxis/ansi"
@@ -150,7 +151,8 @@ type Vaxis struct {
 	ready            bool
 	caps             capabilities
 	graphicsProtocol int
-	graphicsIDNext   uint64
+	graphicsIDNext   atomic.Uint64
+	kittyPayloads    kittyPayloadBudget
 	reqCursorPos     bool
 	charCache        map[string]int
 	cursorNext       cursorState
@@ -674,7 +676,16 @@ outerNew:
 	// draw new placements
 	for _, p1 := range vx.graphicsNext {
 		for _, p2 := range vx.graphicsLast {
-			if samePlacement(p1, p2) {
+			// generation is compared here and not in the delete loop
+			// above. A relayed image re-transmits under the same id at
+			// the same cell: the kitty protocol treats that as replacing
+			// the data in place, so the new bytes have to be written even
+			// though the placement is geometrically identical, and no
+			// delete may be written first or the image blanks for a frame
+			// every time its bytes change. KittyImage and Sixel never set
+			// a generation, so both sides are zero for them and this is
+			// the same test as before.
+			if samePlacement(p1, p2) && p1.generation == p2.generation {
 				// don't write existing placements
 				continue outerNew
 			}
@@ -2254,7 +2265,20 @@ func (vx *Vaxis) CanVisibilityReports() bool {
 	return vx.caps.visibilityReports
 }
 
+// nextGraphicID allocates the next image id. The counter is atomic because
+// [Vaxis.ReserveGraphicID] hands ids out to callers that are not on the
+// goroutine driving the render.
 func (vx *Vaxis) nextGraphicID() uint64 {
-	vx.graphicsIDNext += 1
-	return vx.graphicsIDNext
+	return vx.graphicsIDNext.Add(1)
+}
+
+// ReserveGraphicID allocates an image id from the same counter
+// [Vaxis.NewKittyGraphic] and [Vaxis.NewSixel] draw from.
+//
+// An application relaying another process's kitty graphics has to rename that
+// process's image ids into this terminal's namespace; taking them from the one
+// allocator is what keeps a relayed image from colliding with an image this
+// application transmitted itself.
+func (vx *Vaxis) ReserveGraphicID() uint64 {
+	return vx.nextGraphicID()
 }
