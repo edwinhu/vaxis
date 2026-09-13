@@ -2,6 +2,7 @@ package term
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -259,6 +260,95 @@ func TestKittyPassthroughAcceptedTransmitRepliesOK(t *testing.T) {
 
 	if len(host.relays[0].placements) != 1 {
 		t.Fatalf("placements = %d, want 1", len(host.relays[0].placements))
+	}
+}
+
+// The kitty protocol leaves no image behind a failed transmission, so the id the
+// refused frame named must still be unknown: a later a=p on it is ENOENT, and
+// nothing is placed.
+func TestKittyPassthroughRefusedTransmitLeavesNoImage(t *testing.T) {
+	host := &fakeKittyHost{kitty: true, refuseTransmit: errors.New("kitty payload holds '?' at byte 2")}
+	vt, r := newPassthroughModel(t, host)
+
+	vt.WriteString(passthroughFrame)
+	vt.WriteString("\x1b_Ga=p,i=7,p=2;\x1b\\")
+
+	if got := len(vt.kittyStateOf().images); got != 0 {
+		t.Fatalf("images = %d, want 0 after a refused transmit", got)
+	}
+	if got := len(vt.graphics); got != 0 {
+		t.Fatalf("graphics = %d, want 0; a refused transmit leaves nothing to re-place", got)
+	}
+
+	want := "\x1b_Gi=7,p=2;ENOENT"
+	if got := readReply(t, r, len(want)); got != want {
+		t.Fatalf("reply to a=p after a refused transmit = %q, want prefix %q", got, want)
+	}
+}
+
+// An image the child never transmitted costs nothing, so a refused frame must
+// not push a live image off the end of the cap. Every image below the cap keeps
+// the host data it was holding.
+func TestKittyPassthroughRefusedTransmitEvictsNothing(t *testing.T) {
+	host := &fakeKittyHost{kitty: true}
+	vt, _ := newPassthroughModel(t, host)
+
+	for id := 1; id <= kittyMaxImages; id++ {
+		vt.WriteString(fmt.Sprintf("\x1b[1;1H\x1b_Ga=t,f=32,s=40,v=40,t=d,i=%d,q=2;AAAA\x1b\\", id))
+	}
+	if len(host.relays) != kittyMaxImages {
+		t.Fatalf("relays = %d, want %d", len(host.relays), kittyMaxImages)
+	}
+
+	host.refuseTransmit = errors.New("kitty payload holds '?' at byte 2")
+	vt.WriteString(fmt.Sprintf("\x1b[1;1H\x1b_Ga=t,f=32,s=40,v=40,t=d,i=%d,q=2;AAAA\x1b\\", kittyMaxImages+1))
+
+	for i, relay := range host.relays[:kittyMaxImages] {
+		if relay.destroyed != 0 {
+			t.Fatalf("relay %d destroyed = %d, want 0; a refused frame must evict nothing", i, relay.destroyed)
+		}
+	}
+	if got := len(vt.kittyStateOf().images); got != kittyMaxImages {
+		t.Fatalf("images = %d, want %d", got, kittyMaxImages)
+	}
+}
+
+// A refused RE-transmission is different: the image existed and the relay kept
+// the generation it was holding, so that frame stays on screen. Only the new
+// bytes are dropped.
+func TestKittyPassthroughRefusedRetransmitKeepsPlacement(t *testing.T) {
+	host := &fakeKittyHost{kitty: true}
+	vt, r := newPassthroughModel(t, host)
+
+	vt.WriteString(passthroughFrame)
+	vt.Draw(vaxis.Window{Width: 80, Height: 24})
+
+	if len(host.relays) != 1 {
+		t.Fatalf("relays = %d, want 1", len(host.relays))
+	}
+	relay := host.relays[0]
+	if len(relay.placements) != 1 {
+		t.Fatalf("placements = %d, want 1", len(relay.placements))
+	}
+
+	relay.refuseTransmit = errors.New("kitty payload holds '?' at byte 2")
+	vt.WriteString(passthroughFrameLoud)
+
+	want := "\x1b_Gi=7,p=1;EINVAL"
+	if got := readReply(t, r, len(want)); got != want {
+		t.Fatalf("reply to a refused re-transmit = %q, want prefix %q", got, want)
+	}
+	if relay.destroyed != 0 {
+		t.Fatalf("destroyed = %d, want 0; a refused re-transmit destroys nothing", relay.destroyed)
+	}
+	if got := len(vt.graphics); got != 1 {
+		t.Fatalf("graphics = %d, want 1; the previous frame stays placed", got)
+	}
+
+	vt.Draw(vaxis.Window{Width: 80, Height: 24})
+
+	if len(relay.placements) != 2 {
+		t.Fatalf("placements = %d, want 2; the previous frame is still drawn", len(relay.placements))
 	}
 }
 

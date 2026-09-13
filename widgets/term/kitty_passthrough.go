@@ -378,7 +378,7 @@ func (vt *Model) kittyTransmit(cmd kittyCommand) {
 		return
 	}
 
-	ki := vt.kittyImageFor(cmd, host)
+	ki, known := vt.kittyImageFor(cmd, host)
 	if !vt.transmitKittyFrameFile(ki, cmd) {
 		if err := ki.relay.SetTransmit(kittyForwardControls(cmd), payload); err != nil {
 			// The relay would not take these bytes and kept the ones it
@@ -387,9 +387,22 @@ func (vt *Model) kittyTransmit(cmd kittyCommand) {
 			// landed, and answering OK would leave the sender with no reason
 			// to try again; the command is dropped and the sender told which
 			// fragment was refused.
+			//
+			// An image this command was about to create has no bytes at all
+			// behind it, so it is thrown away instead of registered: the
+			// protocol leaves no image behind a failed transmission, and one
+			// registered here would answer a later a=p on the same id OK and
+			// place a picture the host will never draw. An image that already
+			// existed keeps the generation it was holding, so it stays.
+			if !known {
+				vt.dropKittyRelay(ki)
+			}
 			vt.replyKitty(cmd, errKittyf("EINVAL:%s", err))
 			return
 		}
+	}
+	if !known {
+		vt.registerKittyImage(ki)
 	}
 
 	if cmd.action == 'T' {
@@ -468,16 +481,21 @@ func (vt *Model) kittyFrameFileSource(cmd kittyCommand) (path string, format str
 // terminal applies its own limits.
 const kittyMaxFrameDimension = 1 << 16
 
-// kittyImageFor finds or creates the host image a command names. Reusing the
-// entry is what keeps the HOST image id stable across frames, so the host
-// replaces the picture in place instead of being handed a new image -- and a
-// new image per frame is both a leak and a visible flash.
-func (vt *Model) kittyImageFor(cmd kittyCommand, host kittyRelayHost) *kittyImage {
+// kittyImageFor finds the host image a command names, or builds an unregistered
+// one for it. Reusing the entry is what keeps the HOST image id stable across
+// frames, so the host replaces the picture in place instead of being handed a
+// new image -- and a new image per frame is both a leak and a visible flash.
+//
+// known reports that the image was already in the state. A fresh one is NOT in
+// it yet: it only becomes addressable once its bytes have been accepted, via
+// registerKittyImage, so a transmission the relay refuses leaves nothing behind
+// -- neither an id a later a=p could find nor an eviction charged to it.
+func (vt *Model) kittyImageFor(cmd kittyCommand, host kittyRelayHost) (ki *kittyImage, known bool) {
 	s := vt.kittyStateOf()
 	key, addressable := kittyKey(cmd)
 	if addressable {
 		if ki := s.images[key]; ki != nil && !ki.deleted {
-			return ki
+			return ki, true
 		}
 	} else {
 		// Nothing could name this image again, so it gets a private key that
@@ -486,16 +504,35 @@ func (vt *Model) kittyImageFor(cmd kittyCommand, host kittyRelayHost) *kittyImag
 		key = 1<<33 | uint64(s.nextPID)
 	}
 
-	ki := &kittyImage{
+	return &kittyImage{
 		key:    key,
 		id:     cmd.id,
 		number: cmd.number,
 		relay:  host.NewKittyRelay(),
-	}
-	s.images[key] = ki
-	s.order = append(s.order, key)
+	}, false
+}
+
+// registerKittyImage puts an image kittyImageFor built into the state, once the
+// bytes behind it have been accepted.
+func (vt *Model) registerKittyImage(ki *kittyImage) {
+	s := vt.kittyStateOf()
+	s.images[ki.key] = ki
+	s.order = append(s.order, ki.key)
 	vt.evictOldestKittyImages(s)
-	return ki
+}
+
+// dropKittyRelay throws away the relay of an image that was never registered.
+// The host write is queued rather than performed, like destroyKittyImage's, for
+// the same reason: the caller holds vt.mu.
+func (vt *Model) dropKittyRelay(ki *kittyImage) {
+	ki.deleted = true
+	if ki.relay == nil {
+		return
+	}
+	s := vt.kittyStateOf()
+	s.pendingDestroy = append(s.pendingDestroy, ki.relay)
+	// Published under vt.mu; read lock-free by drainKittyDestroys.
+	vt.kittyDestroyPending.Store(true)
 }
 
 // evictOldestKittyImages frees the host images beyond the cap, oldest first.
