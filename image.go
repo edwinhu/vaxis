@@ -8,6 +8,8 @@ import (
 	"image/color"
 	"image/png"
 	"io"
+	"strings"
+	"sync"
 	"sync/atomic"
 
 	"go.rockorager.dev/vaxis/log"
@@ -237,6 +239,441 @@ func (k *KittyImage) Resize(w int, h int) {
 	}()
 }
 
+// kittyRelayChunk is the payload size of one transmission chunk. The kitty
+// graphics protocol caps an escape code's payload at 4096 base64 bytes.
+const kittyRelayChunk = 4096
+
+// kittyMaxRetainedPayloadBytes bounds the base64 bodies the live relays of one
+// [Vaxis] pin at once.
+//
+// A relay holds on to its body so that a placement in a later frame can
+// re-transmit it, and those bytes were produced by another process: a handful
+// of images at the protocol's own per-transfer ceiling is tens of megabytes of
+// base64 that no render will ever read again. Past the budget the oldest
+// retained body is reclaimed, which costs that image a re-transmission and
+// nothing else.
+const kittyMaxRetainedPayloadBytes = 8 << 20
+
+// kittyMaxPayloadBytes is the largest base64 body one image may be given.
+//
+// The ceiling has to clear the largest frame anyone would relay: a full screen
+// of 32-bit pixels at 3840x2160 is 32 MiB before encoding and a little over
+// 42 MiB after it, so 64 MiB is the first power of two a real image cannot
+// reach. It is not a tuning knob, it is the point past which the string is not
+// a frame at all, and it is what makes the newest body a relay may hold —
+// which [kittyMaxRetainedPayloadBytes] deliberately exempts from reclamation
+// so that an image always has bytes to draw — a bounded amount of memory.
+const kittyMaxPayloadBytes = 64 << 20
+
+// kittyMaxControlBytes is the largest control string, and the largest set of
+// placement keys, one image may be given.
+//
+// Every key the graphics protocol defines is one or two characters with a
+// short value, so a command that names all of them at once is a couple of
+// hundred bytes. Anything past this is not a control string that was parsed
+// out of a command, and refusing it keeps the escape code the relay writes a
+// bounded multiple of the image it is placing.
+const kittyMaxControlBytes = 512
+
+// kittyControlBytes and kittyPayloadBytes are the bytes each caller-supplied
+// fragment may be made of: the key names, values and separators of a control
+// string, and the base64 alphabet of a body.
+//
+// Neither set holds ';' or ESC, which is the point. The relay splices these
+// fragments into an APC escape code, so a fragment carrying either delimiter
+// could end the payload early, close the escape and open another one of its
+// own — and the bytes come from a process the application does not trust with
+// its terminal.
+//
+// Tables rather than comparisons because a body is scanned end to end on the
+// way in and may be tens of megabytes.
+var (
+	kittyControlBytes = kittyByteSet("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789=,")
+	kittyPayloadBytes = kittyByteSet("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+)
+
+// kittyByteSet builds the membership table for an alphabet.
+func kittyByteSet(alphabet string) [256]bool {
+	var set [256]bool
+	for i := 0; i < len(alphabet); i++ {
+		set[alphabet[i]] = true
+	}
+	return set
+}
+
+// checkKittyFragment reports why the relay cannot splice s into an escape code,
+// or nil when it can. what names the fragment for the error message.
+func checkKittyFragment(what, s string, alphabet *[256]bool, limit int) error {
+	if len(s) > limit {
+		return fmt.Errorf("%s is %d bytes, over the %d byte limit", what, len(s), limit)
+	}
+	for i := 0; i < len(s); i++ {
+		if !alphabet[s[i]] {
+			return fmt.Errorf("%s holds %q at byte %d", what, s[i], i)
+		}
+	}
+	return nil
+}
+
+// kittyPayloadBudget is the retained-body accounting shared by the relays of
+// one [Vaxis], which holds it as its kittyPayloads field. Its zero value is an
+// empty budget.
+type kittyPayloadBudget struct {
+	mu    sync.Mutex
+	total int
+	held  []*KittyRelay // oldest retained body first
+}
+
+// KittyRelay is an image on the terminal whose bytes were produced by another
+// process: a child of an embedded terminal, whose own kitty graphics commands
+// are forwarded to the terminal rather than decoded into pixels.
+//
+// The relay owns an image id of its own ([Vaxis.ReserveGraphicID]) and nothing
+// else. The control string and the base64 payload are handed to it already
+// parsed and rebuilt by whoever is doing the relaying, and it never interprets
+// them — but it does not trust them either. A fragment is refused unless it is
+// made of the bytes its alphabet allows and fits the size its kind allows, so
+// that nothing it was given can close the escape code the relay is building,
+// and it writes its own a=, i=, p=, C=, q= and m= after the fragments so that
+// nothing they contain can take those over.
+type KittyRelay struct {
+	vx *Vaxis
+	id uint64
+
+	// mu guards the fields below it, the body among them. SetTransmit runs on
+	// whichever goroutine reads the other process, and the placement is
+	// written during the render, so the two genuinely race: a generation and
+	// the bytes behind it have to become visible together, or a render between
+	// the two would transmit one generation's body under another's controls
+	// and mark that generation sent.
+	//
+	// Lock order is vx.kittyPayloads.mu, then mu; nothing acquires them the
+	// other way around.
+	mu sync.Mutex
+	// generation counts the bodies this image has been given. SetTransmit
+	// bumps it; sentGeneration follows it as they are written.
+	generation uint64
+	// sentGeneration is the generation the terminal was last given. While the
+	// two are equal the terminal holds the current bytes and a placement is a
+	// bare a=p.
+	sentGeneration uint64
+	controls       string
+	payload        string
+	destroyed      bool
+	// dropped records that this generation's body was reclaimed under the
+	// budget before it could be written. There is nothing left to transmit, so
+	// the placement writes nothing at all rather than an empty image.
+	dropped bool
+}
+
+// storePayload replaces the retained body and keeps the running total honest.
+// The caller holds vx.kittyPayloads.mu and r.mu.
+func (r *KittyRelay) storePayload(body string) {
+	r.vx.kittyPayloads.total += len(body) - len(r.payload)
+	r.payload = body
+}
+
+// setPayload stores a body and reclaims older ones until the budget holds.
+func (r *KittyRelay) setPayload(body string) {
+	budget := &r.vx.kittyPayloads
+	budget.mu.Lock()
+	defer budget.mu.Unlock()
+
+	r.mu.Lock()
+	r.storePayload(body)
+	r.mu.Unlock()
+	r.retainLocked(body)
+}
+
+// retainLocked records that r holds body and reclaims older bodies until the
+// budget holds. The caller holds vx.kittyPayloads.mu and no relay's mu.
+func (r *KittyRelay) retainLocked(body string) {
+	budget := &r.vx.kittyPayloads
+	budget.held = dropKittyRelay(budget.held, r)
+	if body == "" {
+		return
+	}
+	// The body just stored goes to the back, so it is the last one reclaimed.
+	budget.held = append(budget.held, r)
+
+	// r is at the back and the loop stops at one, so the victim is never r
+	// itself and taking its mu here cannot deadlock against the caller.
+	for budget.total > kittyMaxRetainedPayloadBytes && len(budget.held) > 1 {
+		victim := budget.held[0]
+		budget.held = dropKittyRelay(budget.held, victim)
+		victim.mu.Lock()
+		if victim.sentGeneration != victim.generation {
+			// Reclaimed before it was ever written, so this generation can
+			// never be transmitted.
+			victim.dropped = true
+		}
+		victim.storePayload("")
+		victim.mu.Unlock()
+	}
+}
+
+// dropKittyRelay returns relays without r. It reuses the backing array and
+// clears the tail, so a relay that was dropped is not kept alive by it.
+func dropKittyRelay(relays []*KittyRelay, r *KittyRelay) []*KittyRelay {
+	kept := relays[:0]
+	for _, relay := range relays {
+		if relay == r {
+			continue
+		}
+		kept = append(kept, relay)
+	}
+	for i := len(kept); i < len(relays); i++ {
+		relays[i] = nil
+	}
+	return kept
+}
+
+// NewKittyRelay allocates an image id for an image another process produced.
+// Nothing is written to the terminal until the relay is given bytes with
+// [KittyRelay.SetTransmit] and placed with [KittyRelay.Place].
+func (vx *Vaxis) NewKittyRelay() *KittyRelay {
+	return &KittyRelay{
+		vx: vx,
+		id: vx.ReserveGraphicID(),
+	}
+}
+
+// ID is the image id this relay was given.
+func (r *KittyRelay) ID() uint64 {
+	return r.id
+}
+
+// SetTransmit replaces the bytes this image is made of.
+//
+// controls is the comma-separated control string without a=, i= or p=, which
+// the relay supplies itself; payload is the base64 body. Each call bumps the
+// generation, which is what makes the next placement transmit the new bytes
+// instead of re-placing the copy the terminal already holds.
+//
+// The controls, the body and the generation are replaced together, so a
+// placement written from another goroutine sees either the whole of this call
+// or none of it.
+//
+// An error is returned, and the image is left entirely as it was, when
+// controls holds a byte that is not part of a control string, when payload
+// holds a byte that is not base64, or when either is longer than its kind is
+// allowed to be ([kittyMaxControlBytes], [kittyMaxPayloadBytes]). The relay
+// splices both into an escape code without reading them, so the alphabets are
+// what stop a fragment ending the payload or the escape early; the caller of a
+// refused frame has a corrupt command and the only thing to do with it is drop
+// it, which is what the terminal sees happen.
+func (r *KittyRelay) SetTransmit(controls, payload string) error {
+	// Checked before any lock is taken: a refused call must leave the
+	// generation, the controls and the body exactly as the last accepted call
+	// left them, so that a placement racing this one still writes a whole
+	// image.
+	if err := checkKittyFragment("kitty control string", controls, &kittyControlBytes, kittyMaxControlBytes); err != nil {
+		return err
+	}
+	if err := checkKittyFragment("kitty payload", payload, &kittyPayloadBytes, kittyMaxPayloadBytes); err != nil {
+		return err
+	}
+
+	budget := &r.vx.kittyPayloads
+	budget.mu.Lock()
+	defer budget.mu.Unlock()
+
+	r.mu.Lock()
+	r.controls = controls
+	r.generation += 1
+	r.dropped = false
+	r.storePayload(payload)
+	r.mu.Unlock()
+	r.retainLocked(payload)
+	return nil
+}
+
+// Place draws the image at win's origin, cols cells wide and rows tall, under
+// the placement id pid, with placementKeys appended verbatim to the control
+// string.
+//
+// placementKeys is the caller's rebuilt c=, r=, x=, y=, w=, h= and z=
+// selection. The relay never parses it: it is a protocol fragment the caller
+// assembled from the command it is relaying, and passing it through unread is
+// what keeps the relay out of the business of knowing every key the protocol
+// has. Two things keep that from being a way in. The keys the relay owns —
+// a=, i=, p=, C=, q= and m= — are written after this fragment, and the
+// terminal reads the last value of a repeated key, so nothing in here can
+// redirect the transmission, rename the image, move the cursor, turn the
+// terminal's replies back on or leave a chunked transfer open. And the fragment has to be a control string: an error is
+// returned, and nothing is queued, when it holds a byte outside the keys,
+// values and commas one is made of, or when it is longer than
+// [kittyMaxControlBytes], so it cannot close this escape code and open one of
+// its own.
+//
+// Like [KittyImage.Draw] this only queues a placement; the bytes are written
+// during the render.
+func (r *KittyRelay) Place(win Window, pid uint32, cols, rows int, placementKeys string) error {
+	// Checked before any lock is taken, and before the placement exists, so a
+	// refused call leaves the frame with exactly the placements it had.
+	if err := checkKittyFragment("kitty placement keys", placementKeys, &kittyControlBytes, kittyMaxControlBytes); err != nil {
+		return err
+	}
+
+	col, row := win.Origin()
+	r.mu.Lock()
+	generation := r.generation
+	r.mu.Unlock()
+	p := &placement{
+		col:        col,
+		row:        row,
+		id:         r.id,
+		w:          cols,
+		h:          rows,
+		generation: generation,
+		writeTo: func(w io.Writer) {
+			r.writePlacement(w, pid, placementKeys)
+		},
+		deleteFn: func(w io.Writer) {
+			r.writeDelete(w, pid)
+		},
+	}
+	r.vx.graphicsNext = append(r.vx.graphicsNext, p)
+	return nil
+}
+
+// Destroy frees the image and every placement of it. The escape is written
+// outside the frame, through the writer's own mutex, because the process
+// behind the image may stop sending at any point and a freed image must not
+// wait for the next render to be released.
+func (r *KittyRelay) Destroy() {
+	r.mu.Lock()
+	if r.destroyed {
+		r.mu.Unlock()
+		return
+	}
+	r.destroyed = true
+	r.controls = ""
+	transmitted := r.sentGeneration != 0
+	r.mu.Unlock()
+	r.setPayload("")
+	if !transmitted {
+		// The terminal was never told about this id, so there is no image
+		// there to free, and a delete for an id it never heard of is an escape
+		// worth not writing.
+		return
+	}
+	r.vx.deleteKittyImage(r.id)
+}
+
+// writePlacement writes either a full transmission or a bare re-placement,
+// depending on whether the terminal already holds this generation's bytes.
+func (r *KittyRelay) writePlacement(w io.Writer, pid uint32, placementKeys string) {
+	// The budget's lock is taken before mu and held across the write, because
+	// the body is reclaimed as part of transmitting it: a SetTransmit landing
+	// between the two would have its bytes thrown away and its generation left
+	// looking transmitted.
+	budget := &r.vx.kittyPayloads
+	budget.mu.Lock()
+	defer budget.mu.Unlock()
+
+	r.mu.Lock()
+	switch {
+	case r.destroyed, r.dropped, r.generation == 0:
+		// The image is gone, or its body was reclaimed under the retained-bytes
+		// budget, or it was never given any bytes at all. In none of the three
+		// is there an image for the terminal to show.
+		r.mu.Unlock()
+		return
+	case r.sentGeneration == r.generation:
+		// Same bytes, so the terminal still holds the image: ask it to put the
+		// one it has here again. C=1 for the same reason as the transmission
+		// below.
+		_, _ = fmt.Fprintf(w, "\x1B_Ga=p,i=%d,p=%d,C=1,q=2\x1B\\", r.id, pid)
+		r.mu.Unlock()
+		return
+	}
+	r.transmitLocked(w, pid, placementKeys)
+	r.sentGeneration = r.generation
+	// The terminal holds the bytes now, so this copy is dead weight. Reclaiming
+	// it here is what keeps the steady state at zero retained bytes: the budget
+	// above only has to catch bodies that were never drawn.
+	r.storePayload("")
+	r.mu.Unlock()
+	r.retainLocked("")
+}
+
+// transmitLocked writes the image data, chunked when it does not fit one
+// escape code. The caller holds mu.
+func (r *KittyRelay) transmitLocked(w io.Writer, pid uint32, placementKeys string) {
+	// These are the relay's own keys rather than keys it relays: the action,
+	// the image id, the placement id, the cursor policy, the reply level and
+	// the chunking below. They go last, after everything the caller supplied,
+	// because the terminal reads the last value of a repeated key. C= in
+	// particular is not the relayed process's to choose: the cursor belongs to
+	// the application embedding the terminal, so a relayed image must never
+	// move it, however the image it came from asked to be placed.
+	relayKeys := fmt.Sprintf("a=T,i=%d,p=%d,C=1,q=2", r.id, pid)
+	controls := joinKittyKeys(r.controls, placementKeys, relayKeys)
+	body := r.payload
+	if len(body) <= kittyRelayChunk {
+		// m=0 even though nothing is chunked: an m=1 in a fragment would
+		// otherwise leave the terminal waiting for chunks that never come, and
+		// swallowing every image escape written after this one as if they were.
+		_, _ = fmt.Fprintf(w, "\x1B_G%s,m=0;%s\x1B\\", controls, body)
+		return
+	}
+	// Chunked: the first escape code carries the controls, every later one
+	// carries only m=, and m=0 marks the last.
+	first := body[:kittyRelayChunk]
+	body = body[kittyRelayChunk:]
+	_, _ = fmt.Fprintf(w, "\x1B_G%s,m=1;%s\x1B\\", controls, first)
+	for len(body) > 0 {
+		n := min(kittyRelayChunk, len(body))
+		more := 1
+		if n == len(body) {
+			more = 0
+		}
+		_, _ = fmt.Fprintf(w, "\x1B_Gm=%d,q=2;%s\x1B\\", more, body[:n])
+		body = body[n:]
+	}
+}
+
+// writeDelete removes this image's placement when a frame no longer has it.
+func (r *KittyRelay) writeDelete(w io.Writer, pid uint32) {
+	r.mu.Lock()
+	destroyed := r.destroyed
+	transmitted := r.sentGeneration != 0
+	r.mu.Unlock()
+	if destroyed || !transmitted {
+		// [KittyRelay.Destroy] already freed the image without waiting for a
+		// render, or the terminal was never told about this id in the first
+		// place. Either way there is no placement of it left to remove.
+		return
+	}
+	_, _ = fmt.Fprintf(w, "\x1B_Ga=d,d=i,i=%d,p=%d,q=2\x1B\\", r.id, pid)
+}
+
+// joinKittyKeys concatenates control fragments with commas, skipping the empty
+// ones so that an absent group cannot produce a ",," the terminal reads as a
+// malformed key.
+func joinKittyKeys(parts ...string) string {
+	var b strings.Builder
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(part)
+	}
+	return b.String()
+}
+
+// deleteKittyImage frees a kitty image and every placement of it.
+//
+// The write goes through the writer's mutex rather than the frame, so it is
+// safe to call from outside the render loop.
+func (vx *Vaxis) deleteKittyImage(id uint64) {
+	vx.writeControlString(fmt.Sprintf("\x1B_Ga=d,d=I,i=%d,q=2\x1B\\", id))
+}
+
 type Sixel struct {
 	vx       *Vaxis
 	img      image.Image
@@ -398,6 +835,10 @@ type placement struct {
 	id       uint64
 	w        int
 	h        int
+	// generation distinguishes two placements of the same image, at the same
+	// cell, whose bytes differ: a relayed frame replacing its predecessor. It
+	// is zero for every image this package encodes itself.
+	generation uint64
 }
 
 // samePlacement compares two placements for equality. Two placements are
